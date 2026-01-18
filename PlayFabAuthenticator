@@ -71,10 +71,10 @@ namespace GorillaNetworking
 				return;
 			}
 
-			PlayFabSettings.TitleId = "1F39E9";
+			PlayFabSettings.TitleId = "PUT YOUR TITLEID HERE!";
 
 			byte[] payload = new byte[1];
-			PlayFabHttp.SimplePostCall("https://1F39E9.playfabapi.com/", payload, delegate { }, delegate { });
+			PlayFabHttp.SimplePostCall("https://PUT YOUR TITLEID HERE!.playfabapi.com/", payload, delegate { }, delegate { });
 
 			if (screenDebugMode)
 			{
