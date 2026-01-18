@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Photon.Pun;
+using Photon.Realtime;
+using PlayFab;
+using PlayFab.ClientModels;
+using PlayFab.Internal;
+using Steamworks;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace GorillaNetworking
+{
+	[Serializable]
+	public struct PhotonAppConfig
+	{
+		public string AppIdRealtime;
+		public string AppIdVoice;
+	}
+
+	public class PlayFabAuthenticator : MonoBehaviourPunCallbacks
+	{
+		public static volatile PlayFabAuthenticator instance;
+
+		[Header("PlayFab Auth Settings")]
+		public string mainAppIDForToken;
+
+		[Header("Photon App ID Pool")]
+		public List<PhotonAppConfig> appIDPool = new List<PhotonAppConfig>();
+		private int currentAppIndex = 0;
+		private AuthenticationValues cachedAuthValues;
+
+		[Header("Status UI")]
+		public Text connectionStatusText;
+
+		[Header("Settings")]
+		public bool isTestAccount;
+		public string testAccountName;
+		public GorillaNetworkJoinTrigger testJoin;
+		public string testRoomToJoin;
+		public string testGameMode;
+		public string _playFabPlayerIdCache;
+		private string _displayName;
+		public string userID;
+		private string orgScopedID;
+		private string userToken;
+		public GorillaComputer gorillaComputer;
+		private byte[] m_Ticket;
+		private uint m_pcbTicket;
+		public Text debugText;
+		public bool screenDebugMode;
+		public bool loginFailed;
+		public GameObject emptyObject;
+		private HAuthTicket m_HAuthTicket;
+		private byte[] ticketBlob = new byte[1024];
+		private uint ticketSize;
+		public string expectedTitleID = "1F39E9";
+		public List<GameObject> Cosmetics;
+		protected Callback<GetAuthSessionTicketResponse_t> m_GetAuthSessionTicketResponse;
+
+		public void Awake()
+		{
+			if (instance == null)
+			{
+				instance = this;
+			}
+			else if (instance != this)
+			{
+				UnityEngine.Object.Destroy(base.gameObject);
+				return;
+			}
+
+			PlayFabSettings.TitleId = "1F39E9";
+
+			byte[] payload = new byte[1];
+			PlayFabHttp.SimplePostCall("https://1F39E9.playfabapi.com/", payload, delegate { }, delegate { });
+
+			if (screenDebugMode)
+			{
+				debugText.text = "";
+			}
+
+			OnGetAuthSessionTicketResponse();
+			AuthenticateWithPlayFab();
+			PlayFabSettings.DisableFocusTimeCollection = true;
+		}
+
+		public void AuthenticateWithPlayFab()
+		{
+			if (!loginFailed)
+			{
+				if (SteamManager.Initialized)
+				{
+					m_HAuthTicket = SteamUser.GetAuthSessionTicket(ticketBlob, ticketBlob.Length, out ticketSize);
+				}
+			}
+		}
+
+		private void RequestPhotonToken(LoginResult obj)
+		{
+			UpdateStatusUI("Authenticating with PlayFab...");
+			_playFabPlayerIdCache = obj.PlayFabId;
+
+			PlayFabClientAPI.GetPhotonAuthenticationToken(new GetPhotonAuthenticationTokenRequest
+			{
+				PhotonApplicationId = mainAppIDForToken
+			}, AuthenticateWithPhoton, OnPlayFabError);
+		}
+
+		private void AuthenticateWithPhoton(GetPhotonAuthenticationTokenResult obj)
+		{
+			cachedAuthValues = new AuthenticationValues();
+			cachedAuthValues.AuthType = CustomAuthenticationType.Custom;
+			cachedAuthValues.AddAuthParameter("username", _playFabPlayerIdCache);
+			cachedAuthValues.AddAuthParameter("token", obj.PhotonCustomAuthenticationToken);
+
+			PhotonNetwork.AuthValues = cachedAuthValues;
+			GetPlayerDisplayName(_playFabPlayerIdCache);
+
+			PlayFabClientAPI.ExecuteCloudScript(new ExecuteCloudScriptRequest
+			{
+				FunctionName = "AddOrRemoveDLCOwnership",
+				FunctionParameter = new { }
+			}, delegate
+			{
+				GorillaTagger.Instance.offlineVRRig.GetUserCosmeticsAllowed();
+			}, delegate (PlayFabError error)
+			{
+				GorillaTagger.Instance.offlineVRRig.GetUserCosmeticsAllowed();
+			});
+
+			if (CosmeticsController.instance != null)
+			{
+				CosmeticsController.instance.Initialize();
+			}
+
+			gorillaComputer.OnConnectedToMasterStuff();
+			AttemptConnection();
+		}
+
+		private void AttemptConnection()
+		{
+			if (appIDPool.Count == 0)
+			{
+				UpdateStatusUI("Error: AppID Pool is empty!");
+				return;
+			}
+
+			if (currentAppIndex < appIDPool.Count)
+			{
+				UpdateStatusUI($"Connecting to Server Group {currentAppIndex + 1}...");
+
+				PhotonNetwork.PhotonServerSettings.AppSettings.AppIdRealtime = appIDPool[currentAppIndex].AppIdRealtime;
+				PhotonNetwork.PhotonServerSettings.AppSettings.AppIdVoice = appIDPool[currentAppIndex].AppIdVoice;
+				PhotonNetwork.PhotonServerSettings.AppSettings.AppVersion = "live1110";
+
+				PhotonNetworkController.instance.InitiateConnection();
+			}
+			else
+			{
+				UpdateStatusUI("Connection Failed: All Servers Full!");
+				gorillaComputer.GeneralFailureMessage("ALL SERVERS ARE CURRENTLY FULL. PLEASE TRY AGAIN LATER.");
+			}
+		}
+
+		public override void OnConnectedToMaster()
+		{
+			UpdateStatusUI("Connected to photon");
+		}
+
+		public override void OnDisconnected(DisconnectCause cause)
+		{
+			if (cause == DisconnectCause.MaxCcuReached)
+			{
+				Debug.LogWarning($"Server {currentAppIndex} is full. Trying next one...");
+				currentAppIndex++;
+				AttemptConnection();
+			}
+			else if (cause != DisconnectCause.None && cause != DisconnectCause.DisconnectByClientLogic)
+			{
+				UpdateStatusUI("Disconnected: " + cause.ToString());
+			}
+		}
+
+		private void UpdateStatusUI(string message)
+		{
+			if (connectionStatusText != null)
+			{
+				connectionStatusText.text = message;
+			}
+			Debug.Log("[Status] " + message);
+		}
+
+		private void OnPlayFabError(PlayFabError obj)
+		{
+			loginFailed = true;
+			if (obj.ErrorMessage == "The account making this request is currently banned")
+			{
+				using (Dictionary<string, List<string>>.Enumerator enumerator = obj.ErrorDetails.GetEnumerator())
+				{
+					if (enumerator.MoveNext())
+					{
+						KeyValuePair<string, List<string>> current = enumerator.Current;
+						if (current.Value[0] != "Indefinite")
+						{
+							gorillaComputer.GeneralFailureMessage("YOU HAVE BEEN BANNED.\nREASON: " + current.Key + "\nHOURS LEFT: " + (int)((DateTime.Parse(current.Value[0]) - DateTime.UtcNow).TotalHours + 1.0));
+						}
+						else
+						{
+							gorillaComputer.GeneralFailureMessage("YOU HAVE BEEN BANNED INDEFINITELY.\nREASON: " + current.Key);
+						}
+					}
+					return;
+				}
+			}
+			UpdateStatusUI("PlayFab Error: " + obj.ErrorMessage);
+			gorillaComputer.GeneralFailureMessage(gorillaComputer.unableToConnect);
+		}
+
+		public void LogMessage(string message) { }
+
+		private void GetPlayerDisplayName(string playFabId)
+		{
+			PlayFabClientAPI.GetPlayerProfile(new GetPlayerProfileRequest
+			{
+				PlayFabId = playFabId,
+				ProfileConstraints = new PlayerProfileViewConstraints { ShowDisplayName = true }
+			}, delegate (GetPlayerProfileResult result)
+			{
+				_displayName = result.PlayerProfile.DisplayName;
+				if (GorillaComputer.instance != null && !string.IsNullOrEmpty(_displayName))
+				{
+					GorillaComputer.instance.savedName = _displayName;
+					GorillaComputer.instance.UpdateScreen();
+				}
+			}, delegate (PlayFabError error)
+			{
+				Debug.LogError(error.GenerateErrorReport());
+			});
+		}
+
+		public void SetDisplayName(string playerName)
+		{
+			if (_displayName == null || (_displayName.Length > 4 && _displayName.Substring(0, _displayName.Length - 4) != playerName))
+			{
+				PlayFabClientAPI.UpdateUserTitleDisplayName(new UpdateUserTitleDisplayNameRequest
+				{
+					DisplayName = playerName
+				}, delegate
+				{
+					_displayName = playerName;
+				}, delegate (PlayFabError error)
+				{
+					Debug.LogError(error.GenerateErrorReport());
+				});
+			}
+		}
+
+		public void ScreenDebug(string debugString)
+		{
+			if (screenDebugMode)
+			{
+				debugText.text = debugText.text + debugString + "\n";
+			}
+		}
+
+		public void ScreenDebugClear()
+		{
+			debugText.text = "";
+		}
+
+		public string GetSteamAuthTicket()
+		{
+			Array.Resize(ref ticketBlob, (int)ticketSize);
+			StringBuilder stringBuilder = new StringBuilder();
+			foreach (byte b in ticketBlob)
+			{
+				stringBuilder.AppendFormat("{0:x2}", b);
+			}
+			return stringBuilder.ToString();
+		}
+
+		private void OnGetAuthSessionTicketResponse()
+		{
+			PlayFabClientAPI.LoginWithCustomID(new LoginWithCustomIDRequest
+			{
+				CreateAccount = true,
+				CustomId = PlayFabSettings.DeviceUniqueIdentifier
+			}, RequestPhotonToken, OnPlayFabError);
+		}
+
+		void Start()
+		{
+			if (PlayFabSettings.TitleId != expectedTitleID)
+			{
+				Application.Quit();
+			}
+		}
+	}
+}
